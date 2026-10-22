@@ -19,6 +19,8 @@ pub(crate) mod nip_fi_test_hooks;
 /// NIP-FI assertion validation at WebSocket upgrade.
 pub(crate) mod nip_fi_upgrade;
 
+/// Agent gateway stamp enforcement (NextWork fork).
+pub mod agent_gateway;
 /// REST API route handlers.
 pub mod api;
 /// WebSocket audio relay for huddle voice channels.

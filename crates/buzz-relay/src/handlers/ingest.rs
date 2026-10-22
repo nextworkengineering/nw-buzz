@@ -2884,6 +2884,9 @@ async fn ingest_event_inner(
         }
     }
 
+    // NextWork fork: agent posts must carry a gateway stamp.
+    crate::agent_gateway::check(state, tenant, &event, kind_u32).await?;
+
     // Handled directly — these mutate relay_members and do NOT get stored.
     // The handler enforces the durable community ban itself: the write-path
     // gate above exempts relay-admin kinds so timed-out admins keep their
