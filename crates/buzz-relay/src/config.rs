@@ -310,6 +310,9 @@ pub struct Config {
     /// and its proxy routes return 404.
     pub klipy: Option<KlipyConfig>,
 
+    /// Agent gateway stamp enforcement (NextWork fork). See [`crate::agent_gateway`].
+    pub agent_gateway: crate::agent_gateway::AgentGatewayConfig,
+
     /// Media storage configuration (S3/MinIO).
     pub media: buzz_media::MediaConfig,
     /// Maximum concurrent media uploads handled by one relay process.
@@ -809,6 +812,8 @@ impl Config {
         let allow_nip_oa_auth = std::env::var("BUZZ_ALLOW_NIP_OA_AUTH")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
+
+        let agent_gateway = crate::agent_gateway::AgentGatewayConfig::from_env()?;
 
         let klipy = std::env::var("BUZZ_KLIPY_API_KEY")
             .ok()
@@ -1436,6 +1441,7 @@ impl Config {
             operator_listener_delivery_urls,
             allow_nip_oa_auth,
             klipy,
+            agent_gateway,
             media,
             media_max_concurrent_uploads,
             media_max_concurrent_uploads_per_pubkey,

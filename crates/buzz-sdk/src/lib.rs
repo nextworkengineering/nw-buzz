@@ -14,6 +14,7 @@
 
 pub mod broker;
 pub mod builders;
+pub mod gateway_stamp;
 pub mod mentions;
 pub mod nip_oa;
 
