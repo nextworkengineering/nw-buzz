@@ -16,6 +16,11 @@
 //!
 //! Gift wraps are not policed: their outer pubkey is a throwaway key, so the
 //! real author is not visible to the relay.
+//!
+//! With `BUZZ_AGENT_GATEWAY_EXEMPT_OWNER_DMS=true`, an attested agent may post
+//! unstamped in a DM whose only members are the agent and its owner. This is
+//! for personal agents (Buzz Desktop) that cannot reach the gateway. Group DMs
+//! and channels still need a stamp, and listed bots never get the exemption.
 
 use std::collections::HashSet;
 
@@ -64,6 +69,8 @@ pub struct AgentGatewayConfig {
     pub gateway_pubkeys: Vec<PublicKey>,
     /// Extra authors to police even without an attested owner.
     pub policed_pubkeys: HashSet<PublicKey>,
+    /// Let attested agents post unstamped in a DM with only their owner.
+    pub exempt_owner_dms: bool,
 }
 
 impl AgentGatewayConfig {
@@ -96,6 +103,18 @@ impl AgentGatewayConfig {
         let policed_pubkeys = parse_pubkeys(&get, "BUZZ_AGENT_GATEWAY_POLICED_PUBKEYS")?
             .into_iter()
             .collect();
+        let exempt_owner_dms = match get("BUZZ_AGENT_GATEWAY_EXEMPT_OWNER_DMS")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("false") | Some("0") | Some("off") => false,
+            Some("true") | Some("1") | Some("on") => true,
+            Some(other) => {
+                return Err(ConfigError::InvalidValue(format!(
+                    "BUZZ_AGENT_GATEWAY_EXEMPT_OWNER_DMS must be true or false, got {other:?}"
+                )))
+            }
+        };
         if mode != AgentGatewayMode::Off && gateway_pubkeys.is_empty() {
             return Err(ConfigError::InvalidValue(
                 "BUZZ_AGENT_GATEWAY_MODE is on but BUZZ_AGENT_GATEWAY_PUBKEYS is empty".into(),
@@ -105,6 +124,7 @@ impl AgentGatewayConfig {
             mode,
             gateway_pubkeys,
             policed_pubkeys,
+            exempt_owner_dms,
         })
     }
 }
@@ -158,6 +178,49 @@ fn decide(is_agent: bool, stamp: &Result<PublicKey, StampError>) -> Verdict {
     }
 }
 
+/// Is this channel a DM whose only members are `author` and its `owner`?
+fn is_owner_dm(channel_type: &str, members: &[Vec<u8>], author: &[u8], owner: &[u8]) -> bool {
+    channel_type == "dm"
+        && members.iter().any(|m| m == owner)
+        && members.iter().all(|m| m == owner || m == author)
+}
+
+/// Look up whether `event` is going into a DM with only the author's owner.
+/// Any lookup failure means "no": the exemption fails closed.
+async fn in_owner_dm(
+    state: &AppState,
+    tenant: &TenantContext,
+    event: &Event,
+    owner: &[u8],
+) -> bool {
+    let Some(ch) = event
+        .tags
+        .iter()
+        .map(|t| t.as_slice())
+        .find(|t| t.first().map(String::as_str) == Some("h"))
+        .and_then(|t| t.get(1))
+        .and_then(|v| uuid::Uuid::parse_str(v).ok())
+    else {
+        return false;
+    };
+    let Ok(channel) = state.db.get_channel(tenant.community(), ch).await else {
+        return false;
+    };
+    if channel.channel_type != "dm" {
+        return false;
+    }
+    let Ok(members) = state.db.get_members(tenant.community(), ch).await else {
+        return false;
+    };
+    let members: Vec<Vec<u8>> = members.into_iter().map(|m| m.pubkey).collect();
+    is_owner_dm(
+        &channel.channel_type,
+        &members,
+        &event.pubkey.to_bytes(),
+        owner,
+    )
+}
+
 fn count(mode: AgentGatewayMode, outcome: &'static str) {
     metrics::counter!(
         "buzz_agent_gateway_verdicts_total",
@@ -192,6 +255,7 @@ pub(crate) async fn check(
 
     // Uncached on purpose: a stale or error-poisoned "human" entry would let
     // an agent through. Only unstamped writes pay for this lookup.
+    let mut owner: Option<Vec<u8>> = None;
     let is_agent = if cfg.policed_pubkeys.contains(&event.pubkey) {
         true
     } else {
@@ -200,7 +264,10 @@ pub(crate) async fn check(
             .get_agent_channel_policy(tenant.community(), &event.pubkey.to_bytes())
             .await
         {
-            Ok(row) => row.is_some_and(|(_, owner)| owner.is_some()),
+            Ok(row) => {
+                owner = row.and_then(|(_, o)| o);
+                owner.is_some()
+            }
             Err(e) if cfg.mode == AgentGatewayMode::Enforce => {
                 count(cfg.mode, "lookup_error");
                 return Err(IngestError::Internal(format!(
@@ -218,6 +285,15 @@ pub(crate) async fn check(
     if decide(is_agent, &stamp) == Verdict::Allow {
         count(cfg.mode, "not_agent");
         return Ok(());
+    }
+
+    if cfg.exempt_owner_dms {
+        if let Some(owner) = &owner {
+            if in_owner_dm(state, tenant, event, owner).await {
+                count(cfg.mode, "owner_dm");
+                return Ok(());
+            }
+        }
     }
 
     let reason = stamp.err().map(|e| e.to_string()).unwrap_or_default();
@@ -308,6 +384,55 @@ mod tests {
     }
 
     #[test]
+    fn owner_dm_exemption_is_narrow() {
+        let (agent, owner, other) = (vec![1u8], vec![2u8], vec![3u8]);
+        assert!(is_owner_dm(
+            "dm",
+            &[agent.clone(), owner.clone()],
+            &agent,
+            &owner
+        ));
+        assert!(
+            !is_owner_dm(
+                "dm",
+                &[agent.clone(), owner.clone(), other.clone()],
+                &agent,
+                &owner
+            ),
+            "group DM"
+        );
+        assert!(
+            !is_owner_dm("dm", &[agent.clone(), other.clone()], &agent, &owner),
+            "someone else's DM"
+        );
+        assert!(
+            !is_owner_dm("stream", &[agent.clone(), owner.clone()], &agent, &owner),
+            "not a DM"
+        );
+        assert!(
+            !is_owner_dm("dm", std::slice::from_ref(&agent), &agent, &owner),
+            "owner left"
+        );
+    }
+
+    #[test]
+    fn exemption_flag_parses_and_defaults_off() {
+        assert!(
+            !AgentGatewayConfig::parse(env(&[]))
+                .unwrap()
+                .exempt_owner_dms
+        );
+        let on = AgentGatewayConfig::parse(env(&[("BUZZ_AGENT_GATEWAY_EXEMPT_OWNER_DMS", "true")]))
+            .unwrap();
+        assert!(on.exempt_owner_dms);
+        assert!(AgentGatewayConfig::parse(env(&[(
+            "BUZZ_AGENT_GATEWAY_EXEMPT_OWNER_DMS",
+            "yes please"
+        )]))
+        .is_err());
+    }
+
+    #[test]
     fn verdicts() {
         let ok: Result<PublicKey, StampError> = Ok(PublicKey::parse(PK).unwrap());
         let missing: Result<PublicKey, StampError> = Err(StampError::Missing);
@@ -348,6 +473,10 @@ mod postgres_tests {
     }
 
     async fn fixture(mode: AgentGatewayMode) -> Fixture {
+        fixture_with(mode, false).await
+    }
+
+    async fn fixture_with(mode: AgentGatewayMode, exempt_owner_dms: bool) -> Fixture {
         let (gateway, owner, agent, bot) = (
             Keys::generate(),
             Keys::generate(),
@@ -360,6 +489,7 @@ mod postgres_tests {
             mode,
             gateway_pubkeys: vec![gateway.public_key()],
             policed_pubkeys: [bot.public_key()].into_iter().collect(),
+            exempt_owner_dms,
         };
         let mut patched = (*base).clone();
         patched.config = Arc::new(config);
@@ -467,6 +597,79 @@ mod postgres_tests {
         let rogue = Keys::generate();
         let res = send(&f, &f.agent, Some(&rogue)).await;
         assert!(is_gateway_rejection(&res), "rogue stamp: {res:?}");
+    }
+
+    async fn dm(f: &Fixture, members: &[&Keys]) -> Uuid {
+        let keys: Vec<Vec<u8>> = members
+            .iter()
+            .map(|k| k.public_key().to_bytes().to_vec())
+            .collect();
+        let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        for k in &refs {
+            f.state
+                .db
+                .ensure_user(f.tenant.community(), k)
+                .await
+                .expect("ensure user");
+        }
+        let (channel, _) = f
+            .state
+            .db
+            .open_dm(
+                f.tenant.community(),
+                &refs,
+                &f.owner.public_key().to_bytes(),
+            )
+            .await
+            .expect("open dm");
+        channel.id
+    }
+
+    async fn send_to(f: &Fixture, author: &Keys, channel: Uuid) -> Result<(), IngestError> {
+        let event = message(author, channel, None);
+        ingest_event(&f.state, &f.tenant, event, http_auth(author))
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn personal_agent_may_dm_only_its_owner() {
+        let f = fixture_with(AgentGatewayMode::Enforce, true).await;
+        let owner_dm = dm(&f, &[&f.agent, &f.owner]).await;
+        let res = send_to(&f, &f.agent, owner_dm).await;
+        assert!(res.is_ok(), "DM with its owner: {res:?}");
+
+        let stranger = Keys::generate();
+        let group = dm(&f, &[&f.agent, &f.owner, &stranger]).await;
+        let res = send_to(&f, &f.agent, group).await;
+        assert!(
+            is_gateway_rejection(&res),
+            "group DM still needs a stamp: {res:?}"
+        );
+
+        let res = send(&f, &f.agent, None).await;
+        assert!(
+            is_gateway_rejection(&res),
+            "channels still need a stamp: {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn exemption_never_covers_listed_bots_or_applies_when_off() {
+        let f = fixture_with(AgentGatewayMode::Enforce, true).await;
+        let bot_dm = dm(&f, &[&f.bot, &f.owner]).await;
+        let res = send_to(&f, &f.bot, bot_dm).await;
+        assert!(
+            is_gateway_rejection(&res),
+            "listed bot has no owner exemption: {res:?}"
+        );
+
+        let off = fixture_with(AgentGatewayMode::Enforce, false).await;
+        let owner_dm = dm(&off, &[&off.agent, &off.owner]).await;
+        let res = send_to(&off, &off.agent, owner_dm).await;
+        assert!(is_gateway_rejection(&res), "exemption off: {res:?}");
     }
 
     #[tokio::test]

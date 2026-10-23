@@ -24,13 +24,14 @@ gateway stamp are rejected.
 | `BUZZ_AGENT_GATEWAY_MODE` | `off` (default, upstream behaviour), `shadow` (log and count), `enforce` (reject) |
 | `BUZZ_AGENT_GATEWAY_PUBKEYS` | Comma-separated gateway keys (hex or npub). Required unless `off` |
 | `BUZZ_AGENT_GATEWAY_POLICED_PUBKEYS` | Extra keys to police that never attested an owner (plain bot keys) |
+| `BUZZ_AGENT_GATEWAY_EXEMPT_OWNER_DMS` | `true` lets an attested agent post unstamped in a DM whose only members are it and its owner (Buzz Desktop personal agents). Default `false`. Listed bots never get it |
 
 Policed authors: any key with `users.agent_owner_pubkey` set, plus the list above.
 Policed kinds: 1, 9, 40002, 40003, 40006, 40007, 40008, 45001, 45003.
 Gift wraps are not policed (the outer key is a throwaway).
 
 Metric: `buzz_agent_gateway_verdicts_total{mode, outcome}` with outcomes
-`stamped`, `not_agent`, `violation`, `lookup_error`.
+`stamped`, `not_agent`, `owner_dm`, `violation`, `lookup_error`.
 
 ## Stamp
 
